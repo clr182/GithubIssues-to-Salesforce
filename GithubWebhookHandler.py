@@ -14,6 +14,9 @@ def lambda_handler(event, context):
     try:
         # Ensure a fresh token is retrieved
         access_token, instance_url = salesforce_authentication()
+
+        # Check for X-GitHub-Event header
+        github_event = event.get('headers', {}).get('X-GitHub-Event')
         
         if 'body' not in event:
             return {
@@ -23,13 +26,17 @@ def lambda_handler(event, context):
 
         data = json.loads(event['body'])
         repository = data.get('repository', {}).get('full_name')
-        issue_data = data.get('issue')
-        action = data.get('action')
+        issue_data = data.get('issue', {})
+        comment_data = data.get('comment', {})
 
-        if action == 'opened':
-            create_salesforce_ticket(access_token, instance_url, issue_data, repository)
-        elif action == 'created':
-            update_salesforce_ticket(access_token, instance_url, issue_data, data.get('comment'), repository)
+        if github_event == 'issues':
+            action = data.get('action')
+            if action == 'opened':
+                create_salesforce_ticket(access_token, instance_url, issue_data, repository)
+        elif github_event == 'issue_comment':
+            action = data.get('action')
+            if action == 'created' and comment_data:
+                add_salesforce_comment(access_token, instance_url, issue_data, comment_data)
 
         return {
             'statusCode': 200,
@@ -67,22 +74,18 @@ def make_salesforce_request(url, method='GET', data=None, access_token=None, ins
 
     response = None
     if method == 'GET':
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, params=data)
     elif method == 'POST':
         response = requests.post(url, headers=headers, json=data)
-    elif method == 'PATCH':
-        response = requests.patch(url, headers=headers, json=data)
 
     # If the session is invalid, re-authenticate and retry the request
     if response.status_code == 401:  # Unauthorized / Token Expired
         access_token, instance_url = salesforce_authentication()
         headers['Authorization'] = f'Bearer {access_token}'
         if method == 'GET':
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, params=data)
         elif method == 'POST':
             response = requests.post(url, headers=headers, json=data)
-        elif method == 'PATCH':
-            response = requests.patch(url, headers=headers, json=data)
 
     response.raise_for_status()
     return response.json()
@@ -90,29 +93,35 @@ def make_salesforce_request(url, method='GET', data=None, access_token=None, ins
 def create_salesforce_ticket(access_token, instance_url, issue_data, repository):
     url = f"{instance_url}/services/data/v56.0/sobjects/Case"
     data = {
-        'Subject': issue_data['title'],
-        'Description': f"Issue in repo {repository}: {issue_data['body']}",
-        'CustomField_GitHub_Issue_ID__c': issue_data['id'],
-        'CustomField_GitHub_Repo__c': repository  # Store the repo name in Salesforce
+        'Subject': issue_data.get('title', 'No Title'),
+        'Description': f"Issue in repo {repository}: {issue_data.get('body', 'No Description')}",
+        'CustomField_GitHub_Issue_ID__c': issue_data.get('id', ''),
+        'CustomField_GitHub_Repo__c': repository
     }
 
     return make_salesforce_request(url, method='POST', data=data, access_token=access_token, instance_url=instance_url)
 
-def update_salesforce_ticket(access_token, instance_url, issue_data, comment_data, repository):
+def add_salesforce_comment(access_token, instance_url, issue_data, comment_data):
+    # First, query to find the Case ID using the GitHub Issue ID
     query_url = f"{instance_url}/services/data/v56.0/query"
-    query = f"SELECT Id FROM Case WHERE CustomField_GitHub_Issue_ID__c = '{issue_data['id']}'"
-
-    cases = make_salesforce_request(query_url, method='GET', access_token=access_token, instance_url=instance_url, data={'q': query})
+    query = f"SELECT Id FROM Case WHERE CustomField_GitHub_Issue_ID__c = '{issue_data.get('id', '')}'"
     
-    if cases['totalSize'] > 0:
+    try:
+        cases = make_salesforce_request(query_url, method='GET', access_token=access_token, instance_url=instance_url, data={'q': query})
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Error querying Salesforce: {str(e)}")
+    
+    if cases.get('totalSize', 0) > 0:
         case_id = cases['records'][0]['Id']
-        update_url = f"{instance_url}/services/data/v56.0/sobjects/Case/{case_id}"
-        updated_description = f"Issue in repo {repository}: {issue_data['body']}"
-        if comment_data:
-            updated_description += f"\n\nComment: {comment_data['body']}"
-
+        comment_url = f"{instance_url}/services/data/v56.0/sobjects/CaseComment/"
+        
+        # Prepare data for the new comment
         data = {
-            'Description': updated_description
+            'ParentId': case_id,
+            'CommentBody': comment_data.get('body', 'No Comment')
         }
 
-        return make_salesforce_request(update_url, method='PATCH', data=data, access_token=access_token, instance_url=instance_url)
+        # POST request to create the new comment
+        return make_salesforce_request(comment_url, method='POST', data=data, access_token=access_token, instance_url=instance_url)
+    else:
+        raise Exception(f"No case found with GitHub Issue ID: {issue_data.get('id', '')}")
