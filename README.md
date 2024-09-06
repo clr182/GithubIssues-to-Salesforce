@@ -1,4 +1,4 @@
-# Github to salesforce
+# Github Issues to salesforce Two way sync
 
 This is a simple project to create a connection between Github and Salesforce.
 You can use this project to create a webhook in Github that will send a message to Salesforce when a new issue is created.
